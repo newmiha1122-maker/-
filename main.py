@@ -47,6 +47,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS fights (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tournament_id INTEGER NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
+        card_type TEXT NOT NULL DEFAULT 'Main Card',
         fighter_a TEXT NOT NULL,
         fighter_b TEXT NOT NULL,
         odds_a REAL NOT NULL,
@@ -97,6 +98,11 @@ def init_db():
         created_at TEXT NOT NULL
     );
     """)
+    # Добавляем колонку card_type, если база уже существовала ранее
+    try:
+        db.execute("ALTER TABLE fights ADD COLUMN card_type TEXT NOT NULL DEFAULT 'Main Card'")
+    except sqlite3.OperationalError:
+        pass
     db.commit()
 
 def now():
@@ -154,6 +160,7 @@ class AdminFlow(StatesGroup):
     disable_code = State()
     tournament_title = State()
     fight_tournament = State()
+    fight_card_type = State()
     fight_a = State()
     fight_b = State()
     fight_odds = State()
@@ -177,8 +184,8 @@ async def start(message: Message, state: FSMContext):
     ensure_user(message.from_user.id, message.from_user.username)
     await message.answer(
         "🥊 <b>VUFC Букмекер</b>\n\n"
-        "Добро пожаловать! Здесь используются только виртуальные средства.\n"
-        "Твой стартовый баланс: <b>0 монет</b>.\n\n"
+        "Добро пожаловать! Здесь используются виртуальные рубли.\n"
+        "Твой стартовый баланс: <b>0 ₽</b>.\n\n"
         "Выбери раздел в меню ниже.",
         reply_markup=main_menu()
     )
@@ -204,18 +211,33 @@ async def card_view(message: Message):
     
     text_lines = []
     for t in tournaments:
-        text_lines.append(f"🥊 <b>{t['title']}</b>\n")
-        fights = db.execute("SELECT * FROM fights WHERE tournament_id=? AND status='open' ORDER BY id", (t["id"],)).fetchall()
-        if fights:
-            text_lines.append("<b>Main Card:</b>")
-            for f in fights:
+        text_lines.append(f"🇮🇹 <b>{t['title']}</b>\n")
+        
+        main_fights = db.execute("SELECT * FROM fights WHERE tournament_id=? AND card_type='Main Card' AND status='open' ORDER BY id", (t["id"],)).fetchall()
+        prelim_fights = db.execute("SELECT * FROM fights WHERE tournament_id=? AND card_type='Prelims' AND status='open' ORDER BY id", (t["id"],)).fetchall()
+        
+        if main_fights:
+            text_lines.append("<b>MAIN CARD:</b>")
+            for f in main_fights:
                 text_lines.append(f"• {f['fighter_a']} vs {f['fighter_b']} — <b>{f['odds_a']:.2f} / {f['odds_b']:.2f}</b>")
-        else:
-            text_lines.append("Бои пока не добавлены.")
-        text_lines.append("")
+            text_lines.append("")
+            
+        if prelim_fights:
+            text_lines.append("<b>PRELIMS:</b>")
+            for f in prelim_fights:
+                text_lines.append(f"• {f['fighter_a']} vs {f['fighter_b']} — <b>{f['odds_a']:.2f} / {f['odds_b']:.2f}</b>")
+            text_lines.append("")
+            
+        if not main_fights and not prelim_fights:
+            text_lines.append("Бои пока не добавлены.\n")
     
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")]])
-    await message.answer("\n".join(text_lines), reply_markup=kb)
+    text_lines.append("📊 Коэффициенты → 🎯 <b>Сделать ставку</b> в меню")
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📺 Канал лиги", url="https://t.me/UFCvirtualleagueMMA")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")]
+    ])
+    await message.answer("\n".join(text_lines), reply_markup=kb, disable_web_page_preview=True)
 
 # --- 2. МОЙ БАЛАНС ---
 @dp.message(F.text == "💰 Мой баланс")
@@ -231,7 +253,7 @@ async def balance_view(message: Message):
 
     text = (
         f"👤 <b>Ваш ник:</b> {username}\n"
-        f"💰 <b>Баланс:</b> {user['balance']:,.2f} монет\n"
+        f"💰 <b>Баланс:</b> {user['balance']:,.2f} ₽\n"
         f"🎯 <b>Активных ставок:</b> {active_bets}"
     )
     
@@ -299,9 +321,7 @@ async def bet_choose_side(callback: CallbackQuery, state: FSMContext):
     selection = fight["fighter_a"] if side == "a" else fight["fighter_b"]
     odds = fight["odds_a"] if side == "a" else fight["odds_b"]
     
-    # Сохраняем текущее событие в список купона
     legs = data.get("legs", [])
-    # Проверка на дублирование боя в купоне
     if any(l["fight_id"] == fight["id"] for l in legs):
         return await callback.answer("Вы уже добавили этот бой в купон!", show_alert=True)
     
@@ -317,7 +337,7 @@ async def bet_choose_side(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BetFlow.amount)
     
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="bet:back_fights")]])
-    await callback.message.answer("Введите сумму ставки (мин. 100):", reply_markup=kb)
+    await callback.message.answer("Введите сумму ставки (мин. 100 ₽):", reply_markup=kb)
     await callback.answer()
 
 @dp.message(BetFlow.amount)
@@ -325,17 +345,15 @@ async def bet_enter_amount(message: Message, state: FSMContext):
     try:
         stake = float((message.text or "").replace(",", "."))
         if stake < 100:
-            return await message.answer("Минимальная сумма ставки — 100 монет. Введите сумму ещё раз:")
+            return await message.answer("Минимальная сумма ставки — 100 ₽. Введите сумму ещё раз:")
     except ValueError:
-        return await message.answer("Пожалуйста, введите корректное число (мин. 100):")
+        return await message.answer("Пожалуйста, введите корректную сумму в рублях (мин. 100 ₽):")
     
     user = get_user(message.from_user.id)
     if user["balance"] < stake:
-        return await message.answer(f"Недостаточно средств. Ваш баланс: {user['balance']:.2f} монет.")
+        return await message.answer(f"Недостаточно средств. Ваш баланс: {user['balance']:.2f} ₽.")
     
     await state.update_data(stake=stake)
-    data = await state.get_data()
-    legs = data["legs"]
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Одинар", callback_data="bet:type:single")],
@@ -357,8 +375,8 @@ async def bet_type_single(callback: CallbackQuery, state: FSMContext):
         f"Бой: {leg['match']}\n"
         f"Ставка: на <b>{leg['selection']}</b>\n"
         f"Кэф: <b>{leg['odds']:.2f}</b>\n"
-        f"Сумма: <b>{stake:.2f} монет</b>\n"
-        f"Возможный выигрыш: <b>{payout:.2f} монет</b>"
+        f"Сумма: <b>{stake:.2f} ₽</b>\n"
+        f"Возможный выигрыш: <b>{payout:.2f} ₽</b>"
     )
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -425,8 +443,8 @@ async def render_express_coupon(message: Message, state: FSMContext):
         lines.append(f"{idx}. {leg['selection']} — {leg['odds']:.2f}")
     
     lines.append(f"\n<b>Итоговый кэф:</b> {total_odds:.2f}")
-    lines.append(f"<b>Сумма:</b> {stake:.2f} монет")
-    lines.append(f"<b>Возможный выигрыш:</b> {stake * total_odds:.2f} монет")
+    lines.append(f"<b>Сумма:</b> {stake:.2f} ₽")
+    lines.append(f"<b>Возможный выигрыш:</b> {stake * total_odds:.2f} ₽")
     
     kb_buttons = [[InlineKeyboardButton(text="➕ Добавить событие", callback_data="bet:express_add")]]
     if len(legs) >= 2:
@@ -530,7 +548,7 @@ async def my_bets_filtered(callback: CallbackQuery):
         lines.append(f"{status_emoji} <b>{b['bet_type'].capitalize()} #{b['id']}</b>")
         for l in legs:
             lines.append(f"• {l['fighter_a']} vs {l['fighter_b']} ➔ {l['selection']}")
-        lines.append(f"Сумма: {b['stake']:.2f} | Кэф: {b['total_odds']:.2f}\n")
+        lines.append(f"Сумма: {b['stake']:.2f} ₽ | Кэф: {b['total_odds']:.2f}\n")
         
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")]])
     await callback.message.edit_text("\n".join(lines), reply_markup=kb)
@@ -546,7 +564,7 @@ async def leaderboard_view(message: Message):
     lines = ["🏆 <b>Таблица лидеров</b>\n"]
     for idx, row in enumerate(rows, 1):
         uname = f"@{row['username']}" if row['username'] else "Игрок"
-        lines.append(f"{idx}. {uname} — <b>{row['balance']:,.2f}</b> монет")
+        lines.append(f"{idx}. {uname} — <b>{row['balance']:,.2f} ₽</b>")
         
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")]])
     await message.answer("\n".join(lines), reply_markup=kb)
@@ -557,8 +575,8 @@ async def leaderboard_view(message: Message):
 async def deposit_menu(event):
     text = (
         "💳 <b>Пополнение баланса</b>\n\n"
-        "Отправьте заявку администратору на пополнение счета.\n"
-        "Укажите нужную сумму и предпочитаемый способ пополнения."
+        "Отправьте заявку администратору на пополнение счета в рублях.\n"
+        "Укажите нужную сумму и реквизиты/способ пополнения."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✉️ Написать админу", callback_data="deposit:request")],
@@ -573,7 +591,7 @@ async def deposit_menu(event):
 @dp.callback_query(F.data == "deposit:request")
 async def deposit_request_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(DepositFlow.details)
-    await callback.message.answer("Укажите сумму и способ пополнения (например: 5000 монет, Каспи):")
+    await callback.message.answer("Укажите сумму в рублях и способ пополнения (например: 1000 рублей, СБП):")
     await callback.answer()
 
 @dp.message(DepositFlow.details)
@@ -602,14 +620,18 @@ async def deposit_request_submit(message: Message, state: FSMContext):
 async def help_view(message: Message):
     text = (
         "ℹ️ <b>Справка и правила бота</b>\n\n"
-        "• Все средства в боте являются <b>виртуальными монетами</b>.\n"
+        "• Все средства в боте являются виртуальными рублями.\n"
         "• Ставки принимаются на одиночные бои (Одинар) и цепочки боёв (Экспресс).\n"
         "• Расчёт происходит сразу после внесения официальных результатов турнира админом.\n"
         "• Для пополнения счета используйте раздел 💳 Пополнить.\n\n"
-        "Возникли вопросы? Напишите /cancel для выхода в меню."
+        "Возникли вопросы? Напишите /cancel для выхода в меню или все вопросы к @Iliaatopuria\n\n"
+        "https://t.me/UFCvirtualleagueMMA"
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")]])
-    await message.answer(text, reply_markup=kb)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📺 Канал лиги", url="https://t.me/UFCvirtualleagueMMA")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")]
+    ])
+    await message.answer(text, reply_markup=kb, disable_web_page_preview=False)
 
 # --- 8. ПРОМОКОДЫ ---
 @dp.message(F.text == "🎟️ Промокоды")
@@ -642,7 +664,7 @@ async def redeem_promo(message: Message, state: FSMContext):
         db.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (promo["reward"], uid))
         db.commit()
         await state.clear()
-        await message.answer(f"✅ Промокод <b>{code}</b> активирован! Начислено: <b>{promo['reward']} монет</b>", reply_markup=main_menu())
+        await message.answer(f"✅ Промокод <b>{code}</b> активирован! Начислено: <b>{promo['reward']} ₽</b>", reply_markup=main_menu())
     except Exception:
         db.rollback()
         await message.answer("Ошибка активации кода.")
@@ -667,7 +689,7 @@ async def admin_promo_code(message: Message, state: FSMContext):
     code = (message.text or "").strip().upper()
     await state.update_data(promo_code=code)
     await state.set_state(AdminFlow.promo_reward)
-    await message.answer("Размер бонуса?")
+    await message.answer("Размер бонуса в рублях?")
 
 @dp.message(AdminFlow.promo_reward)
 async def admin_promo_reward(message: Message, state: FSMContext):
@@ -679,13 +701,13 @@ async def admin_promo_reward(message: Message, state: FSMContext):
     )
     db.commit()
     await state.clear()
-    await message.answer(f"✅ Промокод {data['promo_code']} на {reward} монет создан!", reply_markup=admin_menu())
+    await message.answer(f"✅ Промокод {data['promo_code']} на {reward} ₽ создан!", reply_markup=admin_menu())
 
 @dp.callback_query(F.data == "adm:tournament_create")
 async def admin_tournament_start(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id): return
     await state.set_state(AdminFlow.tournament_title)
-    await callback.message.answer("Название турнира (например UFC 133):")
+    await callback.message.answer("Название турнира (например: UFC COLISEUM 10: USMAN VS ADESANYA 3):")
     await callback.answer()
 
 @dp.message(AdminFlow.tournament_title)
@@ -712,8 +734,21 @@ async def admin_fight_start(callback: CallbackQuery, state: FSMContext):
 async def admin_fight_tournament(callback: CallbackQuery, state: FSMContext):
     tid = int(callback.data.split(":")[2])
     await state.update_data(fight_tournament=tid)
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="MAIN CARD", callback_data="adm:cardtype:Main Card")],
+        [InlineKeyboardButton(text="PRELIMS", callback_data="adm:cardtype:Prelims")]
+    ])
+    await callback.message.answer("Выберите категорию боя:", reply_markup=kb)
+    await state.set_state(AdminFlow.fight_card_type)
+    await callback.answer()
+
+@dp.callback_query(AdminFlow.fight_card_type, F.data.startswith("adm:cardtype:"))
+async def admin_fight_cardtype(callback: CallbackQuery, state: FSMContext):
+    card_type = callback.data.split(":")[-1]
+    await state.update_data(fight_card_type=card_type)
     await state.set_state(AdminFlow.fight_a)
-    await callback.message.answer("Имя первого бойца:")
+    await callback.message.answer(f"Категория: {card_type}\nВведи имя первого бойца:")
     await callback.answer()
 
 @dp.message(AdminFlow.fight_a)
@@ -734,8 +769,8 @@ async def admin_fight_odds(message: Message, state: FSMContext):
     oa, ob = float(parts[0]), float(parts[1])
     data = await state.get_data()
     db.execute(
-        "INSERT INTO fights(tournament_id,fighter_a,fighter_b,odds_a,odds_b) VALUES(?,?,?,?,?)",
-        (data["fight_tournament"], data["fighter_a"], data["fighter_b"], oa, ob)
+        "INSERT INTO fights(tournament_id,card_type,fighter_a,fighter_b,odds_a,odds_b) VALUES(?,?,?,?,?,?)",
+        (data["fight_tournament"], data.get("fight_card_type", "Main Card"), data["fighter_a"], data["fighter_b"], oa, ob)
     )
     db.commit()
     await state.clear()
@@ -773,7 +808,6 @@ async def admin_result_winner(message: Message, state: FSMContext):
     db.execute("UPDATE bet_legs SET result='won' WHERE fight_id=? AND selection=?", (fid, winner))
     db.execute("UPDATE bet_legs SET result='lost' WHERE fight_id=? AND selection!=?", (fid, winner))
     
-    # Расчёт всех активных ставок
     active_bets = db.execute("SELECT * FROM bets WHERE status='active'").fetchall()
     for bet in active_bets:
         legs = db.execute("SELECT * FROM bet_legs WHERE bet_id=?", (bet["id"],)).fetchall()
@@ -799,7 +833,7 @@ async def admin_bonus_start(callback: CallbackQuery, state: FSMContext):
 async def admin_bonus_user(message: Message, state: FSMContext):
     await state.update_data(bonus_user=int(message.text.strip()))
     await state.set_state(AdminFlow.bonus_amount)
-    await message.answer("Сумма бонуса в монетах:")
+    await message.answer("Сумма бонуса в рублях:")
 
 @dp.message(AdminFlow.bonus_amount)
 async def admin_bonus_amount(message: Message, state: FSMContext):
@@ -810,7 +844,7 @@ async def admin_bonus_amount(message: Message, state: FSMContext):
     db.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, uid))
     db.commit()
     await state.clear()
-    await message.answer(f"✅ Начислено {amount} монет пользователю {uid}.", reply_markup=admin_menu())
+    await message.answer(f"✅ Начислено {amount} ₽ пользователю {uid}.", reply_markup=admin_menu())
 
 async def main():
     init_db()
