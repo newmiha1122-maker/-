@@ -2,7 +2,7 @@ import asyncio
 import os
 import sqlite3
 from datetime import datetime, timezone
-from typing import Optional, List, Dict
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -58,9 +58,9 @@ def init_db():
     CREATE TABLE IF NOT EXISTS bets (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL REFERENCES users(user_id),
-        tournament_id INTEGER,
+        tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
         stake REAL NOT NULL,
-        bet_type TEXT NOT NULL,
+        bet_type TEXT NOT NULL DEFAULT 'single',
         status TEXT NOT NULL DEFAULT 'active',
         total_odds REAL NOT NULL,
         payout REAL NOT NULL DEFAULT 0,
@@ -160,20 +160,17 @@ class AdminFlow(StatesGroup):
     promo_expiry = State()
     disable_code = State()
     tournament_title = State()
-    tournament_del_id = State()
     fight_tournament = State()
     fight_card_type = State()
     fight_a = State()
     fight_b = State()
     fight_odds = State()
-    fight_del_id = State()
     result_fight = State()
     result_winner = State()
     bonus_user = State()
     bonus_amount = State()
 
 class BetFlow(StatesGroup):
-    choose_fight = State()
     choose_side = State()
     amount = State()
 
@@ -262,162 +259,101 @@ async def balance_view(message: Message):
     ])
     await message.answer(text, reply_markup=kb)
 
-# --- 3. СДЕЛАТЬ СТАВКУ (КУПОН: ОДИНАР ИЛИ ЭКСПРЕСС) ---
+# --- 3. СДЕЛАТЬ СТАВКУ (ТОЛЬКО ОДИНАРЫ) ---
 @dp.message(F.text == "🎯 Сделать ставку")
 async def start_betting(message: Message, state: FSMContext):
     await state.clear()
-    await show_fights_to_pick(message, state)
-
-async def show_fights_to_pick(message: Message, state: FSMContext):
-    fights = db.execute("SELECT f.*, t.title FROM fights f JOIN tournaments t ON t.id=f.tournament_id WHERE f.status='open' ORDER BY f.id DESC").fetchall()
-    if not fights:
-        return await message.answer("Нет доступных боёв для ставок.")
+    tournaments = db.execute("SELECT * FROM tournaments WHERE status='open' ORDER BY id DESC").fetchall()
+    if not tournaments:
+        return await message.answer("Нет доступных турниров для ставок.")
     
     buttons = [
-        [InlineKeyboardButton(text=f"{f['fighter_a']} vs {f['fighter_b']}", callback_data=f"bet:pick:{f['id']}")]
+        [InlineKeyboardButton(text=f"🥊 {t['title']}", callback_data=f"bet:tourn:{t['id']}")]
+        for t in tournaments
+    ]
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")])
+    await message.answer("<b>Выберите турнир:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@dp.callback_query(F.data.startswith("bet:tourn:"))
+async def bet_select_tournament(callback: CallbackQuery, state: FSMContext):
+    tid = int(callback.data.split(":")[2])
+    fights = db.execute("SELECT * FROM fights WHERE tournament_id=? AND status='open' ORDER BY id", (tid,)).fetchall()
+    if not fights:
+        return await callback.answer("В этом турнире нет открытых боёв.", show_alert=True)
+    
+    buttons = [
+        [InlineKeyboardButton(text=f"{f['fighter_a']} vs {f['fighter_b']}", callback_data=f"bet:fight:{f['id']}")]
         for f in fights
     ]
-    data = await state.get_data()
-    legs = data.get("legs", [])
-    
-    if legs:
-        buttons.append([InlineKeyboardButton(text=f"🛒 Купон ({len(legs)} событий) — Кэф: {calculate_total_odds(legs):.2f}", callback_data="bet:show_coupon")])
-    
-    buttons.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_menu")])
-    
-    text = "<b>Выберите бой для добавления в купон:</b>"
-    if legs:
-        text = f"<b>🛒 В купоне событий: {len(legs)}</b>\nВыберите ещё бой или нажмите купон:"
-        
-    if isinstance(message, CallbackQuery):
-        await message.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    else:
-        await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад к турнирам", callback_data="bet:back_tournaments")])
+    await callback.message.edit_text("<b>Выберите бой:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
 
-def calculate_total_odds(legs):
-    odds = 1.0
-    for l in legs:
-        odds *= l["odds"]
-    return odds
+@dp.callback_query(F.data == "bet:back_tournaments")
+async def bet_back_to_tournaments(callback: CallbackQuery, state: FSMContext):
+    tournaments = db.execute("SELECT * FROM tournaments WHERE status='open' ORDER BY id DESC").fetchall()
+    buttons = [[InlineKeyboardButton(text=f"🥊 {t['title']}", callback_data=f"bet:tourn:{t['id']}")] for t in tournaments]
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")])
+    await callback.message.edit_text("<b>Выберите турнир:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
 
-@dp.callback_query(F.data.startswith("bet:pick:"))
-async def bet_pick_fight(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data.startswith("bet:fight:"))
+async def bet_select_fight(callback: CallbackQuery, state: FSMContext):
     fid = int(callback.data.split(":")[2])
     fight = db.execute("SELECT * FROM fights WHERE id=? AND status='open'", (fid,)).fetchone()
     if not fight:
         return await callback.answer("Бой недоступен.", show_alert=True)
     
-    await state.update_data(current_fight_id=fid)
+    await state.update_data(fight_id=fid, tournament_id=fight["tournament_id"])
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{fight['fighter_a']} — {fight['odds_a']:.2f}", callback_data="bet:side:a")],
-        [InlineKeyboardButton(text=f"{fight['fighter_b']} — {fight['odds_b']:.2f}", callback_data="bet:side:b")],
-        [InlineKeyboardButton(text="⬅️ К списку боёв", callback_data="bet:back_list")]
+        [InlineKeyboardButton(text=f"{fight['fighter_a']} — ${fight['odds_a']:.2f}", callback_data="bet:side:a")],
+        [InlineKeyboardButton(text=f"{fight['fighter_b']} — ${fight['odds_b']:.2f}", callback_data="bet:side:b")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"bet:tourn:{fight['tournament_id']}")]
     ])
-    await callback.message.edit_text(f"Выберите исход для боя <b>{fight['fighter_a']} vs {fight['fighter_b']}</b>:", reply_markup=kb)
+    await callback.message.edit_text(f"Выберите, на кого ставите в бою <b>{fight['fighter_a']} vs {fight['fighter_b']}</b>:", reply_markup=kb)
+    await state.set_state(BetFlow.choose_side)
     await callback.answer()
 
-@dp.callback_query(F.data == "bet:back_list")
-async def bet_back_list(callback: CallbackQuery, state: FSMContext):
-    await show_fights_to_pick(callback, state)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("bet:side:"))
+@dp.callback_query(BetFlow.choose_side, F.data.startswith("bet:side:"))
 async def bet_choose_side(callback: CallbackQuery, state: FSMContext):
     side = callback.data.split(":")[-1]
     data = await state.get_data()
-    fight = db.execute("SELECT * FROM fights WHERE id=?", (data["current_fight_id"],)).fetchone()
+    fight = db.execute("SELECT * FROM fights WHERE id=?", (data["fight_id"],)).fetchone()
     
     selection = fight["fighter_a"] if side == "a" else fight["fighter_b"]
     odds = fight["odds_a"] if side == "a" else fight["odds_b"]
     
-    legs = data.get("legs", [])
-    if any(l["fight_id"] == fight["id"] for l in legs):
-        return await callback.answer("Этот бой уже добавлен в ваш купон!", show_alert=True)
-    
-    legs.append({
-        "fight_id": fight["id"],
-        "tournament_id": fight["tournament_id"],
-        "selection": selection,
-        "odds": odds,
-        "match": f"{fight['fighter_a']} vs {fight['fighter_b']}"
-    })
-    
-    await state.update_data(legs=legs)
-    await show_coupon_screen(callback.message, state, edit=True)
-    await callback.answer()
-
-@dp.callback_query(F.data == "bet:show_coupon")
-async def show_coupon_callback(callback: CallbackQuery, state: FSMContext):
-    await show_coupon_screen(callback.message, state, edit=True)
-    await callback.answer()
-
-async def show_coupon_screen(message: Message, state: FSMContext, edit=False):
-    data = await state.get_data()
-    legs = data.get("legs", [])
-    if not legs:
-        return await message.answer("Ваш купон пуст.", reply_markup=main_menu())
-        
-    total_odds = calculate_total_odds(legs)
-    bet_type = "Одинар" if len(legs) == 1 else f"Экспресс ({len(legs)} событий)"
-    
-    lines = [
-        f"<b>🛒 Купон ставки: {bet_type}</b>\n"
-    ]
-    for idx, l in enumerate(legs, 1):
-        lines.append(f"{idx}. {l['match']}\n   ➔ Выбор: <b>{l['selection']}</b> (кэф: {l['odds']:.2f})")
-        
-    lines.append(f"\n<b>Итоговый коэффициент:</b> {total_odds:.2f}")
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 Ввести сумму и сделать ставку", callback_data="bet:enter_stake")],
-        [InlineKeyboardButton(text="➕ Добавить ещё бой", callback_data="bet:back_list")],
-        [InlineKeyboardButton(text="🗑️ Очистить купон", callback_data="bet:clear_coupon")],
-        [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_to_menu")]
-    ])
-    
-    text = "\n".join(lines)
-    if edit:
-        await message.edit_text(text, reply_markup=kb)
-    else:
-        await message.answer(text, reply_markup=kb)
-
-@dp.callback_query(F.data == "bet:clear_coupon")
-async def clear_coupon(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(legs=[])
-    await show_fights_to_pick(callback, state)
-    await callback.answer("Купон очищен.")
-
-@dp.callback_query(F.data == "bet:enter_stake")
-async def enter_stake_start(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(selection=selection, odds=odds)
     await state.set_state(BetFlow.amount)
-    await callback.message.answer("Введите сумму ставки в долларах ($) (мин. $1.00):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="bet:show_coupon")]
-    ]))
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"bet:tourn:{fight['tournament_id']}")]])
+    await callback.message.answer(f"Вы выбрали: <b>{selection}</b> (кэф {odds:.2f}).\n\nВведите сумму ставки в долларах ($) (мин. $1.00):", reply_markup=kb)
     await callback.answer()
 
 @dp.message(BetFlow.amount)
-async def bet_process_amount(message: Message, state: FSMContext):
+async def bet_enter_amount(message: Message, state: FSMContext):
     try:
         stake = float((message.text or "").replace(",", "."))
         if stake < 1.0:
             return await message.answer("Минимальная сумма ставки — $1.00. Введите сумму ещё раз:")
     except ValueError:
         return await message.answer("Пожалуйста, введите корректное число (например: 100):")
-        
+    
     uid = message.from_user.id
     user = get_user(uid)
     if user["balance"] < stake:
         return await message.answer(f"Недостаточно средств. Ваш баланс: ${user['balance']:.2f}.")
-        
+    
     data = await state.get_data()
-    legs = data.get("legs", [])
-    if not legs:
+    fid = data["fight_id"]
+    tid = data["tournament_id"]
+    selection = data["selection"]
+    odds = data["odds"]
+    
+    fight = db.execute("SELECT * FROM fights WHERE id=? AND status='open'", (fid,)).fetchone()
+    if not fight:
         await state.clear()
-        return await message.answer("Ошибка: купон пуст.", reply_markup=main_menu())
-        
-    total_odds = calculate_total_odds(legs)
-    bet_type = "single" if len(legs) == 1 else "express"
-    payout = round(stake * total_odds, 2)
+        return await message.answer("Этот бой уже закрыт.")
     
     try:
         db.execute("BEGIN IMMEDIATE")
@@ -426,38 +362,34 @@ async def bet_process_amount(message: Message, state: FSMContext):
             db.rollback()
             await state.clear()
             return await message.answer("Недостаточно средств на балансе.")
-            
-        db.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (stake, uid))
         
-        t_id = legs[0]["tournament_id"] if len(legs) == 1 else None
+        db.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (stake, uid))
         cur = db.execute(
-            "INSERT INTO bets(user_id, tournament_id, stake, bet_type, status, total_odds, payout, created_at) VALUES(?,?,?,?,?,?,0,?)",
-            (uid, t_id, stake, bet_type, "active", total_odds, now())
+            "INSERT INTO bets(user_id, tournament_id, stake, bet_type, status, total_odds, payout, created_at) VALUES(?,?,?,'single','active',?,0,?)",
+            (uid, tid, stake, odds, now())
         )
         bet_id = cur.lastrowid
-        
-        for l in legs:
-            db.execute(
-                "INSERT INTO bet_legs(bet_id, fight_id, selection, odds) VALUES(?,?,?,?)",
-                (bet_id, l["fight_id"], l["selection"], l["odds"])
-            )
-            
+        db.execute(
+            "INSERT INTO bet_legs(bet_id, fight_id, selection, odds) VALUES(?,?,?,?)",
+            (bet_id, fid, selection, odds)
+        )
         db.execute(
             "INSERT INTO balance_log(user_id, amount, reason, created_at) VALUES(?,?,?,?)",
-            (uid, -stake, f"Ставка #{bet_id} ({bet_type})", now())
+            (uid, -stake, f"Ставка Одинар #{bet_id}", now())
         )
         db.commit()
     except Exception:
         db.rollback()
         await state.clear()
-        return await message.answer("Произошла ошибка при оформлении ставки.")
-        
+        return await message.answer("Ошибка при оформлении ставки.")
+    
+    payout = stake * odds
     await state.clear()
     await message.answer(
         f"✅ <b>Ставка #{bet_id} успешно принята!</b>\n"
-        f"Тип: {'Одинар' if bet_type=='single' else f'Экспресс ({len(legs)} событий)'}\n"
+        f"Боец: <b>{selection}</b>\n"
         f"Сумма: <b>${stake:.2f}</b>\n"
-        f"Общий кэф: <b>{total_odds:.2f}</b>\n"
+        f"Коэффициент: <b>{odds:.2f}</b>\n"
         f"Возможный выигрыш: <b>${payout:.2f}</b>",
         reply_markup=main_menu()
     )
@@ -495,7 +427,7 @@ async def my_bets_filtered(callback: CallbackQuery):
         ).fetchall()
         
         status_emoji = "🟡" if b["status"] == "active" else ("🟢" if b["status"] == "won" else "🔴")
-        lines.append(f"{status_emoji} <b>{b['bet_type'].capitalize()} #{b['id']}</b>")
+        lines.append(f"{status_emoji} <b>Ставка #{b['id']}</b>")
         for l in legs:
             lines.append(f"• {l['fighter_a']} vs {l['fighter_b']} ➔ {l['selection']}")
         lines.append(f"Сумма: ${b['stake']:.2f} | Кэф: {b['total_odds']:.2f}\n")
@@ -571,7 +503,7 @@ async def help_view(message: Message):
     text = (
         "ℹ️ <b>Справка и правила бота</b>\n\n"
         "• Все средства в боте являются виртуальными долларами ($).\n"
-        "• Ставки принимаются на одиночные бои (Одинар) и цепочки боёв (Экспресс).\n"
+        "• Ставки принимаются на одиночные бои (Одинар).\n"
         "• Расчёт происходит сразу после внесения официальных результатов турнира админом.\n"
         "• Для пополнения счета используйте раздел 💳 Пополнить.\n\n"
         "Возникли вопросы? Напишите /cancel для выхода в меню или все вопросы к @Iliaatopuria\n\n"
