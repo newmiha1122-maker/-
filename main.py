@@ -615,29 +615,6 @@ async def admin_promo_reward(message: Message, state: FSMContext):
     await state.set_state(AdminFlow.promo_limit)
     await message.answer("Лимит активаций? Введи число (например 10) или 0 для безлимита:")
 
-@dp.message(AdminFlow.promo_limit)
-async def admin_promo_limit(message: Message, state: FSMContext):
-    try:
-        limit = int(message.text.strip())
-        max_uses = limit if limit > 0 else None
-    except ValueError:
-        return await message.answer("Введите целое число (например, 10 или 0 для безлимита).")
-        
-    data = await state.get_data()
-    
-    try:
-        db.execute(
-            "INSERT INTO promo_codes(code, reward, max_uses, uses, expires_at, active, created_by, created_at) VALUES(?,?,?,?,NULL,1,?,?)",
-            (data["promo_code"], data["promo_reward"], max_uses, message.from_user.id, now())
-        )
-        db.commit()
-    except sqlite3.IntegrityError:
-        await state.clear()
-        return await message.answer("❌ Ошибка: Промокод с таким кодом уже существует в базе данных!", reply_markup=admin_menu())
-    except Exception as e:
-        await state.clear()
-        return await message.answer(f"❌ Произошла ошибка базы данных: {e}", reply_markup=admin_menu())
-
     await state.clear()
     lim_str = "безлимит" if max_uses is None else str(max_uses)
     await message.answer(
