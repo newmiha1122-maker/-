@@ -259,7 +259,7 @@ async def balance_view(message: Message):
     ])
     await message.answer(text, reply_markup=kb)
 
-# --- 3. СДЕЛАТЬ СТАВКУ (ТОЛЬКО ОДИНАРЫ) ---
+# --- 3. СДЕЛАТЬ СТАВКУ ---
 @dp.message(F.text == "🎯 Сделать ставку")
 async def start_betting(message: Message, state: FSMContext):
     await state.clear()
@@ -527,14 +527,18 @@ async def redeem_promo(message: Message, state: FSMContext):
     if not code:
         return await message.answer("Некорректный код.")
     uid = message.from_user.id
+    username = f"@{message.from_user.username}" if message.from_user.username else f"Игрок (ID: {uid})"
     ensure_user(uid, message.from_user.username)
+    
     try:
         db.execute("BEGIN IMMEDIATE")
         promo = db.execute("SELECT * FROM promo_codes WHERE code=? COLLATE NOCASE", (code,)).fetchone()
+        
         if not promo or not promo["active"]:
             db.rollback()
             await state.clear()
             return await message.answer("❌ Такой промокод не найден или отключён.", reply_markup=main_menu())
+            
         already = db.execute("SELECT 1 FROM promo_redemptions WHERE code=? COLLATE NOCASE AND user_id=?", (code, uid)).fetchone()
         if already:
             db.rollback()
@@ -545,8 +549,29 @@ async def redeem_promo(message: Message, state: FSMContext):
         db.execute("UPDATE promo_codes SET uses=uses+1 WHERE code=? COLLATE NOCASE", (code,))
         db.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (promo["reward"], uid))
         db.commit()
+        
+        new_uses = promo["uses"] + 1
+        if promo["max_uses"] is None:
+            rem_uses_text = "Безлимитно"
+        else:
+            left_uses = promo["max_uses"] - new_uses
+            rem_uses_text = str(max(0, left_uses))
+        
         await state.clear()
         await message.answer(f"✅ Промокод <b>{code}</b> активирован! Начислено: <b>${promo['reward']:.2f}</b>", reply_markup=main_menu())
+        
+        admin_notify_text = (
+            f"🎟️ <b>Активация промокода!</b>\n\n"
+            f"{username} использовал промокод \"<b>{code}</b>\" на <b>${promo['reward']:.2f}</b>\n\n"
+            f"Осталось активаций промокода: <b>{rem_uses_text}</b>"
+        )
+        
+        for admin_id in ADMIN_IDS:
+            try:
+                await message.bot.send_message(admin_id, admin_notify_text)
+            except Exception:
+                pass
+
     except Exception:
         db.rollback()
         await message.answer("Ошибка активации кода.")
@@ -601,7 +626,7 @@ async def admin_tournament_create(message: Message, state: FSMContext):
     await message.answer(f"✅ Турнир «{title}» создан.", reply_markup=admin_menu())
 
 @dp.callback_query(F.data == "adm:tournament_delete")
-async def admin_tournament_delete_start(callback: CallbackQuery, state: FSMContext):
+async def admin_tournament_delete_start(callback: CallbackQuery):
     if not is_admin(callback.from_user.id): return
     rows = db.execute("SELECT id, title FROM tournaments ORDER BY id DESC LIMIT 20").fetchall()
     if not rows:
@@ -705,7 +730,7 @@ async def admin_result_start(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id): return
     rows = db.execute("SELECT f.*, t.title FROM fights f JOIN tournaments t ON t.id=f.tournament_id WHERE f.status='open' ORDER BY f.id DESC").fetchall()
     if not rows:
-        return await callback.message.answer("Нет открытых боёв.")
+        return await callback.answer("Нет открытых боёв.")
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"#{f['id']} {f['fighter_a']} vs {f['fighter_b']}", callback_data=f"adm:rf:{f['id']}")]
         for f in rows
