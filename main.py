@@ -621,17 +621,32 @@ async def admin_promo_limit(message: Message, state: FSMContext):
         limit = int(message.text.strip())
         max_uses = limit if limit > 0 else None
     except ValueError:
-        return await message.answer("Введите целое число.")
+        return await message.answer("Введите целое число (например, 10 или 0 для безлимита).")
         
     data = await state.get_data()
-    db.execute(
-        "INSERT INTO promo_codes(code,reward,max_uses,uses,expires_at,active,created_by,created_at) VALUES(?,?,?,0,NULL,1,?,?)",
-        (data["promo_code"], data["promo_reward"], max_uses, message.from_user.id, now())
-    )
-    db.commit()
+    
+    try:
+        db.execute(
+            "INSERT INTO promo_codes(code, reward, max_uses, uses, expires_at, active, created_by, created_at) VALUES(?,?,?,?,NULL,1,?,?)",
+            (data["promo_code"], data["promo_reward"], max_uses, message.from_user.id, now())
+        )
+        db.commit()
+    except sqlite3.IntegrityError:
+        await state.clear()
+        return await message.answer("❌ Ошибка: Промокод с таким кодом уже существует в базе данных!", reply_markup=admin_menu())
+    except Exception as e:
+        await state.clear()
+        return await message.answer(f"❌ Произошла ошибка базы данных: {e}", reply_markup=admin_menu())
+
     await state.clear()
     lim_str = "безлимит" if max_uses is None else str(max_uses)
-    await message.answer(f"✅ Промокод <code>{data['promo_code']}</code> на <b>${data['promo_reward']:.2f}</b> (лимит: {lim_str}) создан!", reply_markup=admin_menu())
+    await message.answer(
+        f"✅ <b>Промокод создан!</b>\n"
+        f"Код: <code>{data['promo_code']}</code>\n"
+        f"Награда: <b>${data['promo_reward']:.2f}</b>\n"
+        f"Лимит активаций: <b>{lim_str}</b>",
+        reply_markup=admin_menu()
+    )
 
 @dp.callback_query(F.data == "adm:promo_list")
 async def admin_promo_list(callback: CallbackQuery):
@@ -858,3 +873,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
